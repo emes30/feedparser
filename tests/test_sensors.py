@@ -1,17 +1,19 @@
 """"Tests the feedparser sensor."""
 
-
+import re
+from contextlib import nullcontext, suppress
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import feedparser
 import pytest
-from constants import DATE_FORMAT
+from constants import DATE_FORMAT, URLS_HEADERS_REQUIRED
 from feedsource import FeedSource
 
 from custom_components.feedparser.sensor import (
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_THUMBNAIL,
+    IMAGE_REGEX,
     FeedParserSensor,
 )
 
@@ -30,12 +32,13 @@ def test_update_sensor(feed: FeedSource) -> None:
     feed_sensor = FeedParserSensor(
         feed=feed.path.absolute().as_uri(),
         name=feed.name,
-        date_format=DATE_FORMAT,
-        local_time=False,
-        show_topn=9999,
-        inclusions=["image", "title", "link", "published"],
-        exclusions=[],
-        scan_interval=DEFAULT_SCAN_INTERVAL,
+        date_format=feed.sensor_config.date_format,
+        local_time=feed.sensor_config.local_time,
+        show_topn=feed.sensor_config.show_topn,
+        remove_summary_image=feed.sensor_config.remove_summary_image,
+        inclusions=feed.sensor_config.inclusions,
+        exclusions=feed.sensor_config.exclusions,
+        scan_interval=feed.sensor_config.scan_interval,
     )
     feed_sensor.update()
     assert feed_sensor.feed_entries
@@ -53,15 +56,15 @@ def test_update_sensor(feed: FeedSource) -> None:
     assert all(e["published"] for e in feed_sensor.feed_entries)
 
     # assert that all entries have non-default image
-    if feed.all_entries_have_images:
+    if feed.all_entries_have_images and "image" in feed.sensor_config.inclusions:
         if feed.has_images:
             assert all(
                 e["image"] != DEFAULT_THUMBNAIL for e in feed_sensor.feed_entries
-            )
+            ), "Default image found for entry that should have an image"
         else:
             assert all(
                 e["image"] == DEFAULT_THUMBNAIL for e in feed_sensor.feed_entries
-            )
+            ), "Non-default image found for entry that should not have an image"
 
     # assert that all entries have a unique link
     if feed.has_unique_links:
@@ -76,9 +79,10 @@ def test_update_sensor(feed: FeedSource) -> None:
         ), "Duplicate titles found"
 
     # assert that all entries have a unique published date
-    assert len({e["published"] for e in feed_sensor.feed_entries}) == len(
-        feed_sensor.feed_entries,
-    ), "Duplicate published dates found"
+    if feed.has_unique_dates:
+        assert len({e["published"] for e in feed_sensor.feed_entries}) == len(
+            feed_sensor.feed_entries,
+        ), "Duplicate published dates found"
 
     # assert that all entries have a unique image
     if feed.has_images and feed.has_unique_images:
@@ -96,6 +100,7 @@ def test_update_sensor_with_topn(feed: FeedSource) -> None:
         date_format=DATE_FORMAT,
         local_time=False,
         show_topn=show_topn,
+        remove_summary_image=False,
         inclusions=["image", "title", "link", "published"],
         exclusions=[],
         scan_interval=DEFAULT_SCAN_INTERVAL,
@@ -157,3 +162,64 @@ def test_check_duplicates(feed_sensor: FeedParserSensor) -> None:
     feed_sensor.update()
     after_second_update = len(feed_sensor.feed_entries)
     assert after_first_update == after_second_update
+
+
+@pytest.mark.parametrize(
+    "online_feed",
+    URLS_HEADERS_REQUIRED,
+    ids=lambda feed_url: feed_url["name"],
+)
+def test_fetch_data_headers_required(online_feed: dict) -> None:
+    """Test fetching feed from remote server that requires request with headers."""
+    feed_sensor = FeedParserSensor(
+        feed=online_feed["url"],
+        name=online_feed["name"],
+        date_format=DATE_FORMAT,
+        local_time=False,
+        show_topn=9999,
+        remove_summary_image=False,
+        inclusions=["image", "title", "link", "published"],
+        exclusions=[],
+        scan_interval=DEFAULT_SCAN_INTERVAL,
+    )
+    feed_sensor.update()
+    assert feed_sensor.feed_entries
+
+
+def test_remove_summary_image(
+    feed_with_image_in_summary: FeedSource,
+) -> None:
+    """Test that the sensor removes the image from the summary."""
+    feed = feed_with_image_in_summary
+    feed_sensor = FeedParserSensor(
+        **feed.sensor_config_local_feed | {"remove_summary_image": False},
+    )
+    feed_sensor.update()
+    assert feed_sensor.feed_entries
+
+    # assert that the sensor does not remove the image from the summary
+    assert any(
+        re.search(IMAGE_REGEX, e["summary"]) is not None
+        for e in feed_sensor.feed_entries
+    )
+
+    feed_sensor = FeedParserSensor(
+        **feed.sensor_config_local_feed | {"remove_summary_image": True},
+    )
+    feed_sensor.update()
+    assert feed_sensor.feed_entries
+
+    with nullcontext() if feed.all_entries_have_summary else suppress(KeyError):
+        assert all("img" not in e["summary"] for e in feed_sensor.feed_entries)
+
+
+def test_image_not_in_entries(feed: FeedSource) -> None:
+    """Test that the sensor does not include the image in any feed entry."""
+    # keep only the title in the inclusions
+    feed_sensor = FeedParserSensor(
+        **feed.sensor_config_local_feed | {"inclusions": ["title"]},
+    )
+    feed_sensor.update()
+    assert feed_sensor.feed_entries
+    # assert that the sensor does not include the image in its feed entries
+    assert all("image" not in e for e in feed_sensor.feed_entries)
